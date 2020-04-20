@@ -33,7 +33,7 @@ func main() {
 		"c0-e1":     "string:87345",
 		"c0-e2":     "string:X709183",
 		"c0-param0": "Object_Object:{foo:reference:c0-e1, bar:reference:c0-e2}",
-    }
+	}
 	args := []string{"firstArg"}
 
 	res, err := client.Request("/vol/info.do", "MySvcAjax", "getData", args, extraParams)
