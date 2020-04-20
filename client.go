@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"math/rand"
 	"net/http"
 	"net/http/cookiejar"
@@ -16,17 +17,45 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
-type DWRClient struct {
-	httpClient      *http.Client
-	host            string
-	schema          string
-	batchID         int
-	initialized     bool
-	scriptSessionID string
-	params          map[string]string
+// Params used for DWR requests.
+type Params map[string]string
+
+func (p *Params) buffer() *bytes.Buffer {
+	buf := bytes.Buffer{}
+	for k, v := range *p {
+		buf.WriteString(fmt.Sprintf("%s=%s\n", k, v))
+	}
+	return &buf
 }
 
-func NewDWRClient(host, schema string, params map[string]string) (*DWRClient, error) {
+func (p *Params) String() string {
+	return p.buffer().String()
+}
+
+// A Client is a Direct Web Remoting (DWR) client that manages communication with
+// DWR endpoints.
+type Client struct {
+	// HTTP client used to communicate with the DWR server.
+	httpClient *http.Client
+
+	// Base URL for DWR requests.
+	baseURL *url.URL
+
+	// Auto-incremental batch ID.
+	batchID int
+
+	// Whether or not the DWR client is initialized.
+	initialized bool
+
+	// Script Session ID
+	scriptSessionID string
+
+	// Base parameters included in each request.
+	baseParams Params
+}
+
+// NewClient returns a new DWR client.
+func NewClient(baseURL string, baseParams *Params) (*Client, error) {
 	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	if err != nil {
 		return nil, err
@@ -39,52 +68,66 @@ func NewDWRClient(host, schema string, params map[string]string) (*DWRClient, er
 		Jar: jar,
 	}
 
-	dwrClient := &DWRClient{
-		httpClient:  httpClient,
-		host:        host,
-		schema:      schema,
-		batchID:     0,
-		initialized: false,
-		params:      params,
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	err = dwrClient.init()
+	c := &Client{
+		httpClient:  httpClient,
+		baseURL:     u,
+		batchID:     0,
+		initialized: false,
+		baseParams:  *baseParams,
+	}
+
+	err = c.init()
 	if err != nil {
 		return nil, err
 	}
 
-	return dwrClient, nil
+	return c, nil
 }
 
-func (dwr *DWRClient) init() error {
-	dwr.batchID = 0
+// HTTPClient returns the underlying HTTP client used by the DWR client.
+func (c *Client) HTTPClient() *http.Client {
+	return c.httpClient
+}
+
+// init initializes the DWR client by trying to obtain the session ID.
+func (c *Client) init() error {
+	c.batchID = 0
 	script := "__System"
 	method := "generateId"
-	dwr.initialized = true
+	// Need to set initialized to true at this point to allow making the init request
+	c.initialized = true
 
-	res, err := dwr.request("", script, method, nil, nil)
+	res, err := c.Request("", script, method, nil, nil)
 	if err != nil {
+		c.initialized = false
 		return err
 	}
 	defer res.Body.Close()
 
 	bodyBytes, err := ioutil.ReadAll(res.Body)
 	if err != nil {
+		c.initialized = false
 		return err
 	}
 	bodyString := string(bodyBytes)
 
 	re := regexp.MustCompile(`handleCallback\("\w+",\s*"\w+",\s*"(.+?)"\);`)
-	s := re.FindAllStringSubmatch(bodyString, -1)
-	if s == nil || len(s[0]) < 2 {
-		return fmt.Errorf("Could not find DWRSESSIONID in response body")
+	s := re.FindStringSubmatch(bodyString)
+	if s == nil || len(s) < 2 {
+		c.initialized = false
+		return fmt.Errorf("Could not find session ID in response body")
 	}
-	dwrSessionID := s[0][1]
-	dwr.setSession(dwrSessionID)
+	dwrSessionID := s[1]
+	c.setSession(dwrSessionID)
 	return nil
 }
 
-func (dwr *DWRClient) tokenify(number int64) string {
+func (c *Client) tokenify(number int64) string {
 	tokenbuf := []string{}
 	charmap := []rune("1234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ*$")
 	remainder := number
@@ -95,60 +138,58 @@ func (dwr *DWRClient) tokenify(number int64) string {
 	return strings.Join(tokenbuf, "")
 }
 
-func (dwr *DWRClient) setSession(dwrSessionID string) {
-	url := &url.URL{
-		Scheme: dwr.schema,
-		Host:   dwr.host,
-	}
+func (c *Client) setSession(dwrSessionID string) {
 	cookies := []*http.Cookie{
 		{
 			Name:  "DWRSESSIONID",
 			Value: dwrSessionID,
 		},
 	}
-	dwr.httpClient.Jar.SetCookies(url, cookies)
+	c.httpClient.Jar.SetCookies(c.baseURL, cookies)
 
-	pageID1 := dwr.tokenify(time.Now().UnixNano())
-	pageID2 := dwr.tokenify(rand.Int63())
+	pageID1 := c.tokenify(time.Now().UnixNano())
+	pageID2 := c.tokenify(rand.Int63())
 	pageID := fmt.Sprintf("%s-%s", pageID1, pageID2)
 
-	dwr.scriptSessionID = fmt.Sprintf("%s/%s", dwrSessionID, pageID)
+	c.scriptSessionID = fmt.Sprintf("%s/%s", dwrSessionID, pageID)
 }
 
-func (dwr *DWRClient) request(page, script, method string, args []string, extraParams map[string]string) (res *http.Response, err error) {
-	if !dwr.initialized {
+// Request formats and sends a DWR request (HTTP Post request) with the
+// given DWR configuration. The parameters provided in extraParams will
+// override any base parameter if there the key is already present.
+func (c *Client) Request(page, script, method string, args []string, extraParams *Params) (res *http.Response, err error) {
+	if !c.initialized {
 		return nil, fmt.Errorf("DWRClient not initialized")
 	}
 
-	params := make(map[string]string)
-	params["page"] = strings.Replace(page, "/", "%2F", -1)
-	params["batchId"] = strconv.Itoa(dwr.batchID)
-	params["scriptSessionId"] = dwr.scriptSessionID
-	params["c0-scriptName"] = script
-	params["c0-methodName"] = method
-
-	buf := bytes.Buffer{}
-	for k, v := range params {
-		buf.WriteString(fmt.Sprintf("%s=%s\n", k, v))
-	}
-	for k, v := range dwr.params {
-		buf.WriteString(fmt.Sprintf("%s=%s\n", k, v))
-	}
-	for k, v := range extraParams {
-		buf.WriteString(fmt.Sprintf("%s=%s\n", k, v))
+	params := Params{
+		"page":            strings.Replace(page, "/", "%2F", -1),
+		"batchId":         strconv.Itoa(c.batchID),
+		"scriptSessionId": c.scriptSessionID,
+		"c0-scriptName":   script,
+		"c0-methodName":   method,
 	}
 
-	url := dwr.host + "/dwr/call/plaincall/" + script + "." + method + ".dwr"
+	for k, v := range c.baseParams {
+		params[k] = v
+	}
+	if extraParams != nil {
+		for k, v := range *extraParams {
+			params[k] = v
+		}
+	}
 
-	req, err := http.NewRequest("POST", url, &buf)
+	url := c.baseURL.String() + "/dwr/call/plaincall/" + script + "." + method + ".dwr"
+
+	req, err := http.NewRequest("POST", url, params.buffer())
 	if err != nil {
 		return nil, err
 	}
 
-	res, err = dwr.httpClient.Do(req)
+	res, err = c.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	dwr.batchID++
+	c.batchID++
 	return res, nil
 }
