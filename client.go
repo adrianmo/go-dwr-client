@@ -94,6 +94,12 @@ func (c *Client) HTTPClient() *http.Client {
 	return c.httpClient
 }
 
+// SessionID returns the current DWR session ID used by the client.
+// Returns an empty string if the client has not been initialized.
+func (c *Client) SessionID() string {
+	return c.scriptSessionID
+}
+
 // init initializes the DWR client by trying to obtain the session ID.
 func (c *Client) init() error {
 	c.batchID = 0
