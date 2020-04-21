@@ -1,5 +1,7 @@
 # go-dwr-client
 
+![Client Tests](https://github.com/adrianmo/go-dwr-client/workflows/Client%20Tests/badge.svg)
+
 go-dwr-client is a simple Direct Web Remoting Client (DWR) written in Go. This client can be used to 
 communicate with DWR servers.
 
